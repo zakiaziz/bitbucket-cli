@@ -1,0 +1,428 @@
+# CLI conventions
+
+The command-line contract of the `bitbucket` executable. Read before designing,
+implementing, or reviewing commands.
+
+Rules have stable IDs. MUST is required; SHOULD permits a documented exception
+with its reason. Cite IDs in findings. Existing code is not precedent. The
+command registry in `src/` is the command specification (`CLI-SPEC-1`); the
+README `Exceptions` section records every exception.
+
+## Command grammar
+
+~~~text
+<tool> <resource> <action> [identifier] [options]
+<tool> <resource> <subresource> <action> [identifier] [options]
+<tool> <utility-group> <action> [arguments] [options]
+~~~
+
+- `CLI-GRAM-1` MUST use noun-first commands, plural resources, explicit actions,
+  and lowercase kebab-case. Singleton concepts and utility groups remain
+  singular: account, auth, config, api.
+- `CLI-GRAM-2` MUST preserve meaningful provider terminology. Notes and
+  transcripts need not share a name.
+- `CLI-GRAM-3` SHOULD use at most one subresource level, only for a distinct
+  concept. Do not mechanically reproduce API URL hierarchies.
+- `CLI-GRAM-4` MUST use the action vocabulary below. Implement only supported
+  provider capabilities; retain domain actions such as send and publish.
+- `CLI-GRAM-5` MUST reserve edit for opening an editor. Flag-driven changes use
+  update. Inspection uses get, not show, view, or details.
+- `CLI-GRAM-6` SHOULD use one positional identifier for the primary target.
+  Scope and secondary IDs use options; dynamic object types use --type.
+
+| Action | Contract |
+| --- | --- |
+| list | Retrieve a collection, optionally filtered. |
+| get | Retrieve one identified resource or singleton. |
+| search | Search text or a documented provider expression. |
+| create | Create a resource. |
+| update | Change supplied fields; preserve omitted fields. |
+| replace | Replace using a documented complete-input contract. |
+| delete | Delete; document recoverability. |
+| archive / restore | Change archival state where supported. |
+| send / publish / retry | Perform the named domain operation. |
+| export / import | Transfer content through a documented file format. |
+| batch-get / batch-create / batch-update | Operate on explicit multiple targets. |
+
+Examples:
+
+~~~bash
+bitbucket repositories get acme/service
+bitbucket branches list --repository acme/service
+bitbucket pull-requests update 42 --repository acme/service --title "New title"
+bitbucket api request GET /repositories/acme/service
+~~~
+
+## Arguments and input
+
+- `CLI-IN-1` MUST reject unknown commands, options, extra arguments, invalid
+  values, and conflicting inputs before requests. Never execute guessed
+  corrections or silently ignore options.
+- `CLI-IN-2` MUST accept --name value and --name=value, and honor -- as the end
+  of options. IDs are opaque strings. Alternate identifiers require explicit
+  selectors such as --id-property email; do not infer their type.
+- `CLI-IN-3` MUST interpret content literally. Use --body-file PATH for content
+  files and --file PATH for complete structured input. A file path of - means
+  stdin. Do not expand @filename in ordinary content.
+- `CLI-IN-4` MUST reject complete-file input mixed with field flags unless the
+  specification explicitly defines merging. Reject duplicate scalar options;
+  declare repeatable options.
+- `CLI-IN-5` SHOULD use repeatable collection options, such as --label account
+  --label security, instead of comma-delimited input.
+- `CLI-IN-6` MUST distinguish omitted, empty, null, and cleared update values.
+  Document explicit clearing behavior; do not infer removal from empty strings.
+- `CLI-IN-7` MUST document accepted ISO 8601 forms, date-only timezone, and
+  inclusive or exclusive filter boundaries.
+- `CLI-IN-8` MUST validate structured input. Free-form provider properties
+  require explicit input such as --property name=value and documented types.
+
+## Options
+
+- `CLI-OPT-1` MUST use the global names and meanings below. An option is global
+  only when applicable throughout the tool.
+- `CLI-OPT-2` MUST reserve the listed short flags. New flags SHOULD have only
+  long names. --version has no short form.
+- `CLI-OPT-3` MUST keep pagination, confirmation, previews, and file input
+  command-specific. Shared names do not make options global.
+- `CLI-OPT-4` MUST reject irrelevant flags, unsupported formats, and conflicting
+  options, including --quiet with --verbose. Never silently fall back.
+
+| Global option | Contract |
+| --- | --- |
+| --help, -h | Local help; no credentials or network. |
+| --version | Executable name and version as text. |
+| --profile NAME | Select a saved configuration. |
+| --format json\|pretty\|human | Default human: tables or labeled fields. Json: compact and uncolored, for agents and scripts. Pretty: indented JSON with syntax highlighting. |
+| --quiet, -q | Suppress progress and notices, preserving results and errors. |
+| --verbose, -v | Redacted diagnostics on stderr. |
+| --no-input | Never prompt; fail for missing required input. |
+| --color auto\|always\|never | Color for pretty and human formats; default auto. JSON format is always uncolored. |
+| --timeout DURATION | Per-request timeout with units, such as 30s; document default. |
+
+| Command-specific option | Contract |
+| --- | --- |
+| --yes, -y | Supply confirmation. |
+| --dry-run | Preview without writes. |
+| --all | Traverse all collection read pages. |
+| --page-size N | Requested page size within provider limits. |
+| --cursor TOKEN | Resume supported collection reads. |
+| --max-items N | Bound total traversal. |
+| --file PATH | Structured input; - reads stdin. |
+
+Provider options such as --locale retain their meaning and declare their scope.
+Additional presentation formats such as markdown require explicit command support.
+
+## Utilities and configuration
+
+- `CLI-CFG-1` MUST use these names for supported capabilities:
+  profiles list|get|create|update|delete|use; auth verify;
+  config get|list|path; completions bash|zsh|fish;
+  api request METHOD PATH.
+- `CLI-CFG-2` MUST implement setup through the same profile/config operations
+  as explicit commands. Setup may create and activate a profile.
+- `CLI-CFG-3` MUST read credentials and endpoint settings only from a profile.
+  The profile is the one named by `--profile`, otherwise `activeProfile` in
+  `config.json`. No environment variable supplies or selects credentials,
+  endpoints, or profiles; scheduled jobs pass `--profile` explicitly. A missing
+  requested or active profile fails without fallback. The profile stores
+  whatever authenticates the tool (API key, token, cookie, email plus token),
+  and each tool supports one authentication scheme.
+- `CLI-CFG-4` MUST fill profile secrets through a hidden prompt (interactive)
+  or `--<secret>-file PATH` (non-interactive, `-` reads stdin), never a
+  command-line value. MUST redact secrets
+  in diagnostics, previews, and configuration inspection. Declare intentional
+  secret output, such as a newly created webhook signing secret.
+- `CLI-CFG-5` MUST keep configuration in a directory named after the
+  executable, `~/.config/bitbucket`, never the repo or package name
+  (`bitbucket-cli`). Honor an absolute XDG_CONFIG_HOME with ~/.config as
+  fallback, and protect credential files with mode 0600 and their directories
+  with mode 0700 on Unix.
+- `CLI-CFG-6` MUST describe what auth verify proves. A successful resource
+  request does not prove identity or complete permission coverage.
+
+## Help and completion
+
+- `CLI-HELP-1` MUST provide --help at every command level: purpose, usage,
+  types, defaults, allowed values, examples, output, pagination, side effects,
+  and relevant failures.
+- `CLI-HELP-2` MUST show help on stdout and exit 0 for no command and for a
+  command group without an action: the root or group help, exactly as --help
+  prints it. A leaf command with missing or invalid input fails with exit 2
+  and focused usage.
+- `CLI-HELP-3` MUST derive help and completions from the same command
+  definitions. Completion commands print scripts, not edit shell files.
+- `CLI-HELP-4` SHOULD support Bash, Zsh, and Fish completion for commands,
+  options, static values, and local profiles. MUST NOT request network data
+  for completion by default.
+
+## Output
+
+- `CLI-OUT-1` MUST default operational commands to --format human regardless
+  of terminal detection, for the person at the keyboard. Agents and scripts
+  pass --format json: compact JSON on one line, with no indentation, syntax
+  highlighting, or extra whitespace outside string values, followed by one
+  newline. --format pretty is indented, colorized JSON for debugging. Help,
+  version, and completion retain documented text outputs.
+- `CLI-OUT-2` MUST send results to stdout and progress, warnings, prompts,
+  diagnostics, and errors to stderr. Structured results contain no surrounding
+  prose. --format json never contains ANSI escape sequences, even with
+  --color always.
+- `CLI-OUT-3` MUST emit one JSON document for ordinary successful operations.
+  First-class commands use a data/meta envelope. data is an object for one
+  resource, an array for collections, or null for no returned resource.
+- `CLI-OUT-4` MUST preserve provider field names within data. Paginated meta
+  includes next_cursor and has_more where supported. Every network command's
+  meta includes profile, the name of the profile that supplied credentials. Never claim completeness
+  for truncated or provider-capped results.
+- `CLI-OUT-5` MUST preserve provider JSON shape for raw api request output.
+  Represent non-JSON text as a JSON string and an empty body as null.
+  Unsupported binary output fails explicitly.
+- `CLI-OUT-6` SHOULD use tables for human collections and labeled fields for
+  individual resources. Human output is not a parsing contract.
+
+~~~json
+{
+  "data": [{"slug": "service", "name": "Service"}],
+  "meta": {"next_cursor": null, "has_more": false}
+}
+~~~
+
+- `CLI-OUT-7` MUST support --format pretty for the same JSON document and fields
+  as json, indented with two spaces and followed by one newline. Syntax
+  highlighting follows --color; formatting never changes values or schemas.
+- `CLI-OUT-8` MUST apply color independently to each output stream in pretty
+  and human modes. With --color auto, highlight only when that stream is a
+  terminal and NO_COLOR is unset or empty. --color never disables color;
+  explicit --color always enables it, including when redirected or NO_COLOR
+  is set. ANSI-colored pretty output is presentation, not parseable JSON;
+  --format json always remains parseable and uncolored.
+- `CLI-OUT-9` MUST use --format human as the default presentation and support
+  --format json and pretty explicitly. Do not switch formats automatically
+  based on terminal detection.
+
+~~~bash
+bitbucket repositories list --workspace acme                  # Human-readable table (default).
+bitbucket repositories list --workspace acme --format json    # Compact, uncolored JSON.
+bitbucket repositories list --workspace acme --format pretty  # Indented JSON; highlighted in a terminal.
+bitbucket repositories list --workspace acme --format pretty --color never
+~~~
+
+## Errors and exit codes
+
+- `CLI-ERR-1` MUST send structured errors to stderr in json and pretty modes,
+  using the selected format and that stream's color policy, and actionable
+  text in human mode. Codes are stable; messages identify the failed
+  constraint and invalid value when safe. Never echo secrets.
+- `CLI-ERR-2` MUST include provider status, code, and request ID when available.
+  State retryability without implying that repeating a mutation is safe.
+- `CLI-ERR-3` MUST use the exit codes below. Empty collections succeed;
+  missing requested individual resources fail.
+- `CLI-ERR-4` MUST report completed and failed steps/items on partial operations,
+  exit 8, and avoid implying rollback. Specify the partial-result schema.
+
+| Code | Meaning |
+| --- | --- |
+| 0 | Success, including empty collections. |
+| 1 | Unexpected or unclassified failure. |
+| 2 | Invalid command, argument, or option. |
+| 3 | Missing or invalid configuration or authentication. |
+| 4 | Permission denied. |
+| 5 | Resource not found. |
+| 6 | Conflict or unmet precondition. |
+| 7 | Rate limit or transient service/network failure. |
+| 8 | Partial completion. |
+| 9 | Confirmation required or declined. |
+| 130 | Interrupted by user. |
+
+~~~json
+{
+  "error": {
+    "code": "INVALID_ARGUMENT",
+    "message": "--page-size must be an integer from 10 to 100; received \"101\".",
+    "hint": "Use --page-size 100.",
+    "retryable": false
+  }
+}
+~~~
+
+## Mutations and automation
+
+- `CLI-SAFE-1` MUST require confirmation for remote mutations. In an interactive
+  terminal, show profile, target, and effects before prompting. --yes supplies
+  confirmation, never missing fields, validation bypass, or authorization.
+- `CLI-SAFE-2` MUST NOT prompt with --no-input, nonterminal stdin, or CI mode.
+  Missing confirmation exits 9. CI mode means CI is nonempty and not 0 or false,
+  case-insensitively. Never consume request-content stdin as prompt input.
+- `CLI-SAFE-3` MUST NOT alias --force to --yes. A constraint override requires
+  a distinct documented meaning and still needs mutation confirmation.
+- `CLI-SAFE-4` MUST make dry runs write-free and redact previews. State whether
+  previews validate locally or also read remotely. Preview success does not
+  guarantee execution success. Dry runs need no confirmation.
+- `CLI-SAFE-5` MUST classify first-class operations by effects, not HTTP method.
+  POST search is a read. Raw requests conservatively require confirmation for
+  methods other than GET, HEAD, and OPTIONS.
+- `CLI-SAFE-6` MUST require explicit targets for destructive batches. --all
+  belongs to read pagination, never implicit mutation scope.
+- `CLI-SAFE-7` MUST document multi-request atomicity. Do not promise rollback
+  without implementing it.
+- `CLI-SAFE-8` MUST return job ID and status for asynchronous work. If supported,
+  --wait has a documented overall timeout distinct from request timeout.
+
+## Pagination, batches, and retries
+
+- `CLI-PAGE-1` MUST fetch one page by default. --all follows continuation;
+  --max-items bounds traversal. Document provider limits and ordering.
+- `CLI-PAGE-2` MUST preserve continuation without skipping items. When stopping
+  mid-page, preserve unread position or stop at a resumable boundary.
+  Never return a next-page cursor after discarding unread current-page items.
+- `CLI-PAGE-3` MUST report pagination limitations. Do not invent usable cursors
+  when the provider cannot support continuation.
+- `CLI-BATCH-1` MUST use explicit batch actions and per-item outcomes.
+  Partial success is not exit 0.
+- `CLI-RETRY-1` SHOULD retry safe reads with bounded backoff and provider retry
+  guidance. MUST NOT automatically retry mutations unless duplicate effects
+  are prevented. An unknown outcome is not proof of failure.
+
+## Raw API access
+
+- `CLI-API-1` MUST use api request METHOD PATH, repeatable --query key=value,
+  and --file PATH for structured bodies. Preserve explicit provider query names.
+  Reject unknown flags instead of translating them into API fields.
+- `CLI-API-2` MUST document supported methods, authentication, and content
+  types. Never silently send selected-profile credentials to another origin.
+- `CLI-API-3` MUST separate raw access from first-class input contracts.
+  It is an escape hatch, not a second implicit option interpretation.
+
+## Compatibility and implementation
+
+- `CLI-COMPAT-1` MUST version commands, options, defaults, JSON shapes, and exit
+  codes as contracts. Publish migration mappings before removing old behavior.
+- `CLI-COMPAT-2` MUST keep one canonical spelling. Temporary aliases warn on
+  stderr and name their removal release. Do not add permanent get/show/view
+  or singular/plural synonyms.
+- `CLI-COMPAT-3` MUST explicitly migrate existing -v version behavior before
+  assigning -v to verbose. Do not silently reinterpret scripts.
+- `CLI-ARCH-1` SHOULD share parsing, output, errors, confirmation, and help
+  machinery. MUST keep provider authentication and API behavior in focused
+  components. Prefer composition over a provider-aware base class.
+- `CLI-VERIFY-1` MUST verify changed contracts by running the built CLI:
+  parsing failures before requests, streams, schemas, exit codes,
+  non-interactive execution, confirmation, previews, pagination, and partial
+  failures as relevant, using loopback mock servers for network paths. The
+  repository carries no test suite. Never exercise live mutations merely to
+  test CLI behavior.
+
+## Distribution and installation
+
+- `CLI-DIST-1` MUST publish as `@zakiaziz/bitbucket-cli` on the npm registry. The
+  `bin` key is `bitbucket`.
+- `CLI-DIST-2` MUST target Node. The executable starts with
+  `#!/usr/bin/env node`, `engines.node` names the oldest supported Node LTS
+  (currently `>=22`), and code uses only Node APIs, never `Bun.*` globals. Bun
+  runs the same file unchanged.
+- `CLI-DIST-3` MUST ship a prebuilt executable. `bin` points into `dist/`,
+  `dist/` stays out of Git, `prepack` runs the build, and `files` lists only
+  `dist`, `README.md`, `LICENSE`, and `docs`. The build bundles dependencies
+  with `bun build --target=node`.
+- `CLI-DIST-4` MUST declare `license`, `repository`, and
+  `"publishConfig": {"access": "public"}`.
+- `CLI-DIST-5` MUST document installation in the README as
+  `npm install -g @zakiaziz/bitbucket-cli` and `bun add -g @zakiaziz/bitbucket-cli`.
+  User-facing install steps never require `git clone` or a build.
+- `CLI-DIST-6` MUST install maintainer checkouts with `bun link` from the
+  checkout, which places the command in `~/.bun/bin`. Keep one install per
+  machine: no copies in nvm, `~/.local/bin`, or other global prefixes.
+- `CLI-DIST-7` MUST keep runtime selection out of the package. Maintainer
+  machines that run only Bun invoke the linked command as `bun <command path>`
+  from a shell profile script; the published file carries no launcher logic.
+  Cron jobs and systemd units load no profile, so they call
+  `/home/<user>/.bun/bin/bun /home/<user>/.bun/bin/bitbucket` with absolute
+  paths.
+- `CLI-DIST-8` MUST keep the repository self-contained. Code, docs, and commit
+  messages describe only this tool: no references to any employer, to other
+  tools, or to an external standards file. Because the code and docs cite rule
+  IDs, the repository ships this file.
+- `CLI-DIST-9` MUST commit as `Zaki Aziz <vexity@gmail.com>`, set in this
+  repository with `git config user.email`, so a different global Git identity
+  never applies.
+- `CLI-DIST-10` MUST keep an unpublished tool at version `0.1.0` with no
+  migration guides. Versioning and `CLI-COMPAT-1` migration mappings start with
+  the first npm publish.
+- `CLI-DIST-11` MUST NOT add CI workflows (`.github/workflows` or similar).
+
+~~~bash
+npm install -g @zakiaziz/bitbucket-cli    # Node users.
+bun add -g @zakiaziz/bitbucket-cli        # Bun users.
+cd bitbucket-cli && bun run build && bun link   # Maintainers.
+~~~
+
+## Command specification template
+
+- `CLI-SPEC-1` MUST specify each new or changed command using these fields in
+  its command registry. Reference shared policies instead of duplicating them. Record exceptions with rule IDs and reasons.
+
+~~~yaml
+command: bitbucket pull-requests update
+summary: Update supplied pull request fields.
+arguments:
+  - name: PULL_REQUEST_ID
+    type: string
+    required: true
+options:
+  - name: repository
+    type: string
+    required: true
+  - name: title
+    type: string
+validation:
+  - Require at least one changed field.
+  - Reject unknown options, extra arguments, and conflicting file input.
+authentication:
+  profile: required
+  access: write
+  permissions: [write:pullrequest:bitbucket]
+effects:
+  kind: remote-mutation
+  confirmation: required
+  dry-run: supported
+  atomic: true
+  sequence:
+    - Send one PUT request to the identified pull request.
+output:
+  human: Pull request fields.
+pagination: not-applicable
+failures:
+  - INVALID_ARGUMENT
+  - AUTHENTICATION_FAILED
+  - PERMISSION_DENIED
+  - NOT_FOUND
+  - CONFIRMATION_REQUIRED
+retry:
+  automatic: false
+  reason: A repeated mutation may duplicate effects.
+examples:
+  - bitbucket pull-requests update 42 --repository acme/service --title "Add login" --dry-run
+compatibility:
+  deprecated-aliases: []
+exceptions: []
+~~~
+
+## References
+
+The numbered rules define this tool's contract. The human default, the JSON envelope, and
+exit-code assignments are deliberate choices, not universal Unix requirements.
+
+- [Command Line Interface Guidelines](https://clig.dev/)
+- [GNU argument syntax conventions](https://sourceware.org/glibc/manual/2.33/html_node/Argument-Syntax.html)
+
+## Tool notes
+
+- Authentication: the CLI sends the Atlassian account email and scoped API token as HTTP Basic credentials. Profiles store `email`, `apiToken`, `access`, `workspace`, and `baseUrl`. Only the token is secret. The default base URL is `https://api.bitbucket.org/2.0`, used as a path prefix.
+- Access levels: each created profile requires explicit `read` or `write` access. Read profiles refuse every resource mutation locally, including dry runs. The same lock applies to raw mutations. Provider scopes still govern remote permissions.
+- Identifiers: repository targets accept `WORKSPACE/REPO_SLUG` or a bare slug with an explicit or saved workspace. A qualified target conflicts with a different explicit workspace. Profile defaults are documented; the CLI does not infer targets from the working directory.
+- Pagination: lists return one page by default. `--page-size` requests 10 to 100 items; `--all` follows validated same-origin next URLs and `--cursor` resumes one. `--max-items` stops before a continuation page that exceeds the remaining budget, keeping its page size. Results can contain fewer than N items, including none. `meta.next_cursor` points at the first unread page and `meta.has_more` reports remaining pages.
+- Redirects: `pull-requests diff get` and `pipelines logs get` follow up to three same-origin redirects within each attempt timeout. Other commands reject redirects. Text and empty responses become strings in the resource envelope; unexpected JSON and binary responses fail with request metadata.
+- Error handling: messages combine the provider's `error.message`, `error.detail`, and validation messages from `error.fields`. HTTP statuses map to the closed vocabulary. Raw 2xx error bodies print with credentials scrubbed before the error is reported on stderr. API tokens and encoded Basic credentials are scrubbed from errors and previews.
+- Identity: `auth verify` sends `GET /user`, returns account identity, and reads `x-oauth-scopes` when present. Missing scope headers yield null and do not imply a permission check passed.
+- Input: pull request updates preserve omitted fields. Explicit clear flags set an empty description or reviewer array. Complete JSON input rejects unknown keys and conflicts with field flags. Pipeline variables require an explicit `secured` boolean and unique keys matching `^[A-Za-z_][A-Za-z0-9_]*$`. `pipelines run` and raw writes redact secured values at any depth in previews and errors. Raw requests support GET, HEAD, OPTIONS, POST, PUT, PATCH, and DELETE; mutations require write access and confirmation. Preparation validates scope conflicts and structured content before profile resolution and reads stdin once. Secondary target IDs use `--parent-id`, `--pull-request-id`, and `--pipeline-id`.
+- Asynchronous operations: accepted merges return HTTP status 202 in `meta.provider.status` and a task ID in `meta.provider.task_id`, read from a validated same-origin `Location` header or the response body. `data` keeps the provider body and may be null. The merge-task read checks completion. Pipeline runs return UUID and state, and stopping a pipeline signals cancellation without claiming it has completed.
