@@ -1,8 +1,9 @@
 import type { Endpoint } from "./core/access.js";
-import { CliError, usageError } from "./core/errors.js";
-import type { HookHelpers, RequestSpec, ResourceCommand } from "./core/provider.js";
-import { FILE_OPTION, type ArgumentSpec, type Context, type Exception, type GroupSpec, type OptionSpec } from "./core/registry.js";
-import { echoable, invalidValue, isRecord, missingFields, readInput, readJsonFile, redact, REDACTED, validateId } from "./core/values.js";
+import type { Call, Client, MutationPlan } from "./core/client.js";
+import { asCliError, CliError, stepsFailure, usageError } from "./core/errors.js";
+import type { HookHelpers, Pagination, RequestSpec, ResourceCommand, RunResult } from "./core/provider.js";
+import { FILE_OPTION, type ArgumentSpec, type Context, type Exception, type GroupSpec, type OptionSpec, type PaginationSpec } from "./core/registry.js";
+import { echoable, invalidValue, isRecord, missingFields, readInput, readJsonFile, redact, REDACTED, sameOriginUrl, validateId } from "./core/values.js";
 
 const REPOSITORY_HELP = "Repository as WORKSPACE/REPO_SLUG, or REPO_SLUG with --workspace or the profile workspace.";
 const WORKSPACE: OptionSpec = {
@@ -24,6 +25,41 @@ const CLOSE_BRANCH = booleanOption("close-source-branch", "Whether Bitbucket sho
 const DRAFT = booleanOption("draft", "Whether the pull request is a draft.");
 const REVIEWER: OptionSpec = { ...idOption("reviewer", "UUID", "Reviewer UUID. Replaces the reviewer list on update."), repeatable: true };
 const MERGE_STRATEGIES = ["merge_commit", "squash", "fast_forward", "squash_fast_forward", "rebase_fast_forward", "rebase_merge"];
+const PR_STATES = ["OPEN", "MERGED", "DECLINED", "SUPERSEDED"];
+const MERGE_WAIT_MS = 120_000;
+const MERGE_POLL_MS = 1_000;
+
+function urlPagination(max: number): Pagination {
+  return {
+    continuation: "url",
+    cursorSize: (url) => {
+      const sizes = url.searchParams.getAll("pagelen");
+      // An opaque URL can omit pagelen. Budget for the endpoint maximum without changing it.
+      if (sizes.length === 0) return max;
+      return sizes.length === 1 && /^[0-9]+$/.test(sizes[0] ?? "") ? Number(sizes[0]) : undefined;
+    },
+    apply: (request, page) => {
+      if (page.cursor === null) request.query.set("pagelen", String(page.size));
+    },
+    read: (payload) => {
+      if (!isRecord(payload)) return undefined;
+      if (payload.next !== undefined && payload.next !== null && typeof payload.next !== "string") return undefined;
+      return { nextCursor: payload.next ?? null };
+    },
+  };
+}
+
+export const pagination = urlPagination(100);
+
+const PR_PAGES: PaginationSpec = {
+  min: 10, max: 50, default: 50, boundary: "preserve-cursor-size",
+  style: urlPagination(50),
+  ordering: "Order is set by Bitbucket unless --sort is supplied. With --ticket, page size and --max-items count candidates before exact matching.",
+};
+const PAGE_EXCEPTIONS: Exception[] = [
+  { rule: "STYLE-PAGE-2", reason: "Continuation URLs stay unchanged. --max-items budgets for their pagelen, or the endpoint maximum when pagelen is absent. It stops before a page that exceeds the remaining budget, so it can return fewer than N items, including none." },
+  { rule: "STYLE-OPT-6", reason: "--page-size starts at 10 because the provider specifies a minimum of 10. Pull request lists allow at most 50; other lists allow at most 100." },
+];
 
 export const groups: GroupSpec[] = [
   { path: ["branches"], summary: "List, get, create, and delete branches.", title: "Manage branches." },
@@ -37,6 +73,8 @@ export const groups: GroupSpec[] = [
   { path: ["pull-requests", "comments"], summary: "List and create pull request comments.", title: "Manage pull request comments." },
   { path: ["pull-requests", "activity"], summary: "List pull request activity.", title: "Inspect pull request activity." },
   { path: ["pull-requests", "diff"], summary: "Get a pull request diff.", title: "Inspect pull request diffs." },
+  { path: ["pull-requests", "conflicts"], summary: "List pull request file conflicts.", title: "Inspect pull request file conflicts." },
+  { path: ["pull-requests", "ticket-keys"], summary: "List ticket keys in pull request commits.", title: "Inspect pull request ticket keys." },
   { path: ["pull-requests", "merge-tasks"], summary: "Get asynchronous merge status.", title: "Inspect merge tasks." },
   { path: ["repositories"], summary: "List and get repositories.", title: "Inspect repositories." },
   { path: ["users"], summary: "Get the current user.", title: "Inspect the current user." },
@@ -120,8 +158,8 @@ const reads: ReadDefinition[] = [
     list: true,
     options: [
       ...REPO_SCOPE,
-      { ...idOption("include", "REVISION", "Include commits reachable from this revision."), repeatable: true },
-      { ...idOption("exclude", "REVISION", "Exclude commits reachable from this revision."), repeatable: true },
+      { ...idOption("include", "REF", "Include commits reachable from this ref. Without it, include all refs."), repeatable: true },
+      { ...idOption("exclude", "REF", "Exclude commits reachable from this ref."), repeatable: true },
     ],
     ordering: "Reverse chronological order, with descendants before parents.",
     request: (context, endpoint) => ({ path: `${repo(context, endpoint)}/commits`, query: [
@@ -138,22 +176,6 @@ const reads: ReadDefinition[] = [
     options: REPO_SCOPE,
     request: (context, endpoint) => ({ path: `${repo(context, endpoint)}/commit/${encodedArgument(context)}` }),
     example: "bitbucket commits get a1b2c3d4 --repository acme/service",
-  },
-  {
-    path: ["pull-requests", "list"],
-    summary: "List pull requests in a repository.",
-    resource: "pull request objects",
-    list: true,
-    options: [
-      ...REPO_SCOPE,
-      FILTER,
-      SORT,
-      { name: "state", placeholder: "STATE", type: "enum", choices: ["OPEN", "MERGED", "DECLINED", "SUPERSEDED"], repeatable: true, description: "State to include. Without it, Bitbucket returns open pull requests." },
-    ],
-    request: (context, endpoint) => ({ path: `${repo(context, endpoint)}/pullrequests`, query: [
-      ...query(context, { filter: "q", sort: "sort" }), ...context.options.strings("state").map((value): [string, string] => ["state", value]),
-    ] }),
-    example: "bitbucket pull-requests list --repository acme/service --state OPEN",
   },
   {
     path: ["pull-requests", "get"],
@@ -309,10 +331,7 @@ function readCommand(definition: ReadDefinition): ResourceCommand {
     collectionKey: "values",
     providerMeta: ["size"],
     pagination: { min: 10, max: 100, default: 100, boundary: "preserve-cursor-size", ordering: definition.ordering ?? "Order is set by Bitbucket and is undocumented." },
-    exceptions: [...base.exceptions,
-      { rule: "STYLE-PAGE-2", reason: "Continuation URLs keep their page size. --max-items stops before a page that exceeds the remaining budget, so it can return fewer than N items, including none." },
-      { rule: "STYLE-OPT-6", reason: "--page-size accepts 10 to 100 because the provider specifies a minimum of 10." },
-    ],
+    exceptions: [...base.exceptions, ...PAGE_EXCEPTIONS],
   };
   if (definition.text) return {
     ...base,
@@ -334,6 +353,200 @@ function readCommand(definition: ReadDefinition): ResourceCommand {
     },
   };
   return { ...base, method: "GET", request: definition.request, emptyIsNotFound: true };
+}
+
+const pullRequestReads: ResourceCommand[] = [
+  {
+    path: ["pull-requests", "list"],
+    summary: "List pull requests in a repository.",
+    arguments: [],
+    options: [
+      ...REPO_SCOPE,
+      { name: "query", placeholder: "EXPRESSION", type: "string", description: "BBQL filter expression, sent as q. Combined with the ticket prefilter using AND." },
+      SORT,
+      { name: "state", placeholder: "STATE", type: "enum", choices: PR_STATES, repeatable: true, description: "State to include. Without it, Bitbucket returns open pull requests." },
+      {
+        name: "ticket", placeholder: "KEY", type: "string", repeatable: true,
+        description: "Match any ticket key. The source branch must equal KEY or start with KEY-, or the title must contain KEY as a whole token. Case sensitive. Uses a BBQL prefilter, then exact local matching.",
+        check: (value) => checkTicketPart("--ticket", value, true),
+      },
+    ],
+    effects: { kind: "read" },
+    output: "Collection envelope. data is an array of pull requests, each with sorted, unique ticket_keys from its title and source branch. meta holds profile, next_cursor, has_more, and provider.size when supplied. size counts server candidates before exact ticket matching.",
+    pagination: PR_PAGES,
+    failures: ["NOT_FOUND"],
+    exceptions: PAGE_EXCEPTIONS,
+    examples: ["bitbucket pull-requests list --repository acme/service --state OPEN --state MERGED --all --format json"],
+    async run(context, client) {
+      const tickets = [...new Set(context.options.strings("ticket"))];
+      const clauses: string[] = [];
+      const expression = context.options.string("query");
+      if (expression !== undefined) clauses.push(`(${expression})`);
+      if (tickets.length) clauses.push(`(${tickets.map((key) => `(source.branch.name ~ "${key}" OR title ~ "${key}")`).join(" OR ")})`);
+      const seen = new Set<number>();
+      const call: Call = {
+        path: `${repo(context, client.endpoint)}/pullrequests`, method: "GET", mutation: false,
+        query: [
+          ...query(context, { sort: "sort" }),
+          ...context.options.strings("state").map((state): [string, string] => ["state", state]),
+          ...(clauses.length ? [["q", clauses.join(" AND ")] as [string, string]] : []),
+        ],
+        collectionKey: "values", providerMeta: ["size"],
+        select: (payload) => checkedValues(payload, (item) => {
+          const pr = enrichPullRequest(item);
+          if (typeof pr.id !== "number" || !Number.isSafeInteger(pr.id) || pr.id <= 0) {
+            throw responseField("pullrequests[].id", "be a positive safe integer", pr.id);
+          }
+          if (seen.has(pr.id)) throw responseField("pullrequests[].id", "be unique across all pages", pr.id);
+          seen.add(pr.id);
+          return pr;
+        }),
+      };
+      try {
+        const result = await client.paginate(call);
+        return { ...result, data: matchPullRequests(result.data, tickets) };
+      } catch (error) {
+        if (!(error instanceof CliError) || !error.extra.partial || !("data" in error.extra.partial)) throw error;
+        throw new CliError(error.code, error.message, {
+          ...error.extra,
+          partial: { ...error.extra.partial, data: matchPullRequests(error.extra.partial.data, tickets) },
+        });
+      }
+    },
+  },
+  {
+    path: ["pull-requests", "conflicts", "list"],
+    summary: "List file conflicts in a pull request.",
+    arguments: [PR_ID],
+    options: REPO_SCOPE,
+    effects: { kind: "read", summary: "Reads the dedicated file-conflicts endpoint, following up to 3 redirects on the configured origin per request. Reflects Bitbucket's view at the time of the call; a clean result does not guarantee a merge succeeds." },
+    output: "Resource envelope. data is {has_conflicts, conflicts}; conflicts contains every provider file-conflict object, including path. has_conflicts is true when the list is nonempty. Duplicate paths fail. meta has profile, next_cursor: null, and has_more: false. A later-page failure exits 8 with completed conflict objects in partial.data.",
+    unpaginated: "Fetches every conflict page automatically, requesting 100 items per page. Preserves provider order. No pagination flags.",
+    exceptions: [{ rule: "STYLE-TIME-1", reason: "The PR conflicts endpoint redirects to repository file conflicts. Follows up to 3 redirects on the configured origin within each request timeout." }],
+    examples: ["bitbucket pull-requests conflicts list 42 --repository acme/service --format json"],
+    async run(context, client) {
+      const result = await readPullRequestPages(context, client, "conflicts", (item) => {
+        if (!isRecord(item) || typeof item.path !== "string" || item.path === "") {
+          throw responseField("conflicts[].path", "be a nonempty string", isRecord(item) ? item.path : item);
+        }
+        return item;
+      });
+      return { data: { has_conflicts: result.data.length > 0, conflicts: result.data }, meta: result.meta };
+    },
+  },
+  {
+    path: ["pull-requests", "ticket-keys", "list"],
+    summary: "List ticket keys in pull request commit messages.",
+    arguments: [PR_ID],
+    options: [...REPO_SCOPE, {
+      name: "project", placeholder: "PROJ", type: "string", repeatable: true,
+      description: "Keep keys with this exact uppercase project prefix. Without it, include every project.",
+      check: (value) => checkTicketPart("--project", value, false),
+    }],
+    effects: { kind: "read" },
+    output: "Collection envelope. data is [{key, commit_hashes}], sorted by key with unique, sorted commit hashes. Keys match [A-Z][A-Z0-9]+-[0-9]+ as whole tokens. Duplicate source commit hashes fail. meta has profile, next_cursor: null, and has_more: false. A later-page failure exits 8 with completed commit objects in partial.data; those are incomplete input, not a complete key list.",
+    unpaginated: "Fetches every PR commit page automatically, requesting 100 items per page. These commits are not on the destination. Bitbucket returns an empty list if the source branch no longer exists. No pagination flags.",
+    examples: ["bitbucket pull-requests ticket-keys list 42 --repository acme/service --format json"],
+    async run(context, client) {
+      const result = await readPullRequestPages(context, client, "commits", (item) => {
+        if (!isRecord(item) || typeof item.hash !== "string" || item.hash === "") {
+          throw responseField("commits[].hash", "be a nonempty string", isRecord(item) ? item.hash : item);
+        }
+        if (typeof item.message !== "string") throw responseField("commits[].message", "be a string", item.message);
+        return item;
+      });
+      const projects = context.options.strings("project");
+      const hashes = new Map<string, Set<string>>();
+      for (const commit of result.data) {
+        for (const key of ticketKeys(commit.message as string)) {
+          if (projects.length && !projects.includes(key.slice(0, key.indexOf("-")))) continue;
+          const commits = hashes.get(key) ?? new Set<string>();
+          commits.add(commit.hash as string);
+          hashes.set(key, commits);
+        }
+      }
+      return {
+        data: [...hashes.keys()].sort().map((key) => ({ key, commit_hashes: [...hashes.get(key)!].sort() })),
+        meta: result.meta,
+      };
+    },
+  },
+];
+
+function checkedValues(payload: unknown, check: (item: unknown) => Record<string, unknown>): unknown {
+  if (!isRecord(payload) || !Array.isArray(payload.values)) return payload;
+  return { ...payload, values: payload.values.map(check) };
+}
+
+function checkTicketPart(field: string, value: string, key: boolean): string {
+  const pattern = key ? /^[A-Z][A-Z0-9]+-[0-9]+$/ : /^[A-Z][A-Z0-9]+$/;
+  if (!pattern.test(value)) {
+    throw invalidValue(field, `match ${pattern.source}`, echoable(value), key ? "Supply an uppercase project prefix, a hyphen, and a numeric issue number." : "Supply at least two uppercase letters or digits, starting with a letter.");
+  }
+  return value;
+}
+
+function ticketKeys(text: string): string[] {
+  return [...new Set(text.match(/(?<![\p{L}\p{M}\p{N}_])[A-Z][A-Z0-9]+-[0-9]+(?![\p{L}\p{M}\p{N}_])/gu) ?? [])].sort();
+}
+
+interface TicketPullRequest extends Record<string, unknown> {
+  title: string;
+  source: { branch: { name: string } };
+  ticket_keys: string[];
+}
+
+function enrichPullRequest(item: unknown): TicketPullRequest {
+  if (!isRecord(item) || typeof item.title !== "string") {
+    throw responseField("pullrequests[].title", "be a string", isRecord(item) ? item.title : item);
+  }
+  const source = item.source;
+  const branch = isRecord(source) ? source.branch : undefined;
+  if (!isRecord(branch) || typeof branch.name !== "string" || branch.name === "") {
+    throw responseField("pullrequests[].source.branch.name", "be a nonempty string", isRecord(branch) ? branch.name : branch);
+  }
+  return { ...item, ticket_keys: [...new Set([...ticketKeys(item.title), ...ticketKeys(branch.name)])].sort() } as TicketPullRequest;
+}
+
+function matchPullRequests(data: unknown, tickets: string[]): TicketPullRequest[] {
+  const items = data as TicketPullRequest[];
+  if (tickets.length === 0) return items;
+  return items.filter((item) => {
+    const titleKeys = ticketKeys(item.title);
+    const branch = item.source.branch.name;
+    return tickets.some((key) => branch === key || branch.startsWith(`${key}-`) || titleKeys.includes(key));
+  });
+}
+
+async function readPullRequestPages(context: Context, client: Client, resource: "commits" | "conflicts", check: (item: unknown) => Record<string, unknown>) {
+  const seen = new Set<string>();
+  try {
+    const result = await client.paginate({
+      path: `${pullRequest(context, client.endpoint)}/${resource}`, method: "GET", mutation: false,
+      ...(resource === "conflicts" ? { redirects: "same-origin" as const } : {}),
+      collectionKey: "values",
+      select: (payload) => checkedValues(payload, (value) => {
+        const item = check(value);
+        const field = resource === "commits" ? "hash" : "path";
+        const identity = item[field] as string;
+        if (seen.has(identity)) throw responseField(`${resource}[].${field}`, "be unique across all pages", identity);
+        seen.add(identity);
+        return item;
+      }),
+    }, { style: pagination, pageSize: 100, all: true, min: 10, max: 100, boundary: "preserve-cursor-size" });
+    return { data: result.data as Record<string, unknown>[], meta: result.meta };
+  } catch (error) {
+    if (!(error instanceof CliError) || error.code !== "PARTIAL_FAILURE") throw error;
+    throw new CliError(error.code, error.message, {
+      ...error.extra, hint: `Run the command again to rebuild the complete result. partial.data contains only the ${resource} read before the failure.`,
+    });
+  }
+}
+
+function responseField(field: string, constraint: string, value: unknown): CliError {
+  return new CliError("INVALID_RESPONSE", `Bitbucket Cloud ${field} must ${constraint}; received "${echoable(JSON.stringify(value) ?? "undefined")}".`, {
+    hint: "Check the remote state. If the failure persists, the Bitbucket Cloud API contract may have changed.",
+  });
 }
 
 const mutations: ResourceCommand[] = [
@@ -388,38 +601,18 @@ const mutations: ResourceCommand[] = [
       bodyFile("Read the literal merge commit message from PATH. - reads stdin.", ["message"]),
       CLOSE_BRANCH,
       { name: "strategy", placeholder: "STRATEGY", type: "enum", choices: MERGE_STRATEGIES, description: "Merge strategy. Omission uses the repository setting." },
+      { name: "wait-timeout", placeholder: "DURATION", type: "duration", default: "2m", description: "Overall asynchronous merge wait in ms, s, or m, from 1ms to 10m. Polls every 1s. Starts after acceptance; --timeout still limits each request." },
     ],
-    effects: { kind: "remote-mutation", summary: "Merges the pull request. May queue an asynchronous merge; acceptance does not prove completion. --close-source-branch true deletes the source branch after merging. Bitbucket has no branch restore endpoint; recreation requires the previous commit hash to remain available." },
-    output: "Resource envelope. data is the pull request object, or the accepted task result for HTTP 202, which may be null; meta has profile. meta.provider.status is the HTTP status; 202 means accepted. meta.provider.task_id identifies an asynchronous task; meta.provider.location retains its URL when supplied. Use merge-tasks get with that task ID to read completion.",
+    effects: { kind: "remote-mutation", summary: "Reads the PR before confirmation and sends no merge request if already MERGED. Otherwise sends one merge POST, reconciles network, timeout, or 5xx failures by reading the PR, and waits for asynchronous completion. Dry runs validate locally and send nothing. --close-source-branch true deletes the source branch after merging; recreation requires the previous commit hash to remain available.", atomicity: "The merge can complete even if verification fails. A failed wait reports the accepted task as partial completion; no rollback occurs." },
+    output: "Resource envelope. data is the MERGED pull request, including merge_commit.hash; meta has profile. meta.provider contains the merge HTTP status when sent, task_id, location, and task_status for asynchronous work, and note for an already merged or reconciled PR. A failed asynchronous wait exits 8 with the accepted task in partial.completed. OPEN after an uncertain POST reports the original failure with retryable: true; the POST is never retried automatically.",
     exceptions: [domainAction("merge"), {
-      rule: "STYLE-OUT-2", reason: "meta.provider includes the HTTP status and asynchronous task ID and Location because an accepted merge can return an empty body.",
+      rule: "STYLE-OUT-2", reason: "meta.provider includes merge HTTP status, task identity and status, and a note when no POST was needed or a read proved completion after an uncertain POST.",
+    }, {
+      rule: "STYLE-ERR-3", reason: "An uncertain merge POST followed by a PR read that returns OPEN reports the original failure as retryable. Each invocation still makes at most one merge POST.",
     }],
     examples: ["bitbucket pull-requests merge 42 --repository acme/service --strategy squash --dry-run"],
     prepare: (context) => defined({ message: content(context, "message"), merge_strategy: context.options.string("strategy"), close_source_branch: booleanValue(context, "close-source-branch") }),
-    async run(context, client, body) {
-      let metadata: Record<string, unknown> = {};
-      const result = await client.mutate({
-        effect: `Merges pull request ${argument(context)} in ${required(context, "repository")}.${context.options.string("close-source-branch") === "true" ? " Deletes the source branch after merging. There is no branch restore endpoint; recreation needs the previous commit hash." : ""}`,
-        steps: [{ name: "merge pull request", call: {
-          path: `${pullRequest(context, client.endpoint)}/merge`, method: "POST", mutation: true, body,
-          settle({ data }, _context, helpers) {
-            metadata = { status: helpers.provider.status };
-            if (helpers.provider.status === 202) {
-              Object.assign(metadata, mergeTask(data, helpers, client.access().baseUrl));
-            } else if (!isRecord(data) || typeof data.id !== "number" || !Number.isSafeInteger(data.id) || data.id <= 0 || typeof data.state !== "string" || data.state === "") {
-              throw new CliError("INVALID_RESPONSE", "Bitbucket Cloud merge response must contain a positive integer id and a nonempty state; completion is unknown.", {
-                hint: "Check the pull request state before retrying.",
-                outcome: "unknown",
-                provider: helpers.provider,
-              });
-            }
-            return data;
-          },
-        } }],
-      });
-      if (!result) return undefined;
-      return { data: result[0]?.data ?? null, meta: { provider: metadata } };
-    },
+    run: mergePullRequest,
   },
   ...(["decline", "approve", "unapprove"] as const).map((action): ResourceCommand => ({
     path: ["pull-requests", action],
@@ -512,7 +705,7 @@ const mutations: ResourceCommand[] = [
   },
 ];
 
-export const commands: ResourceCommand[] = [...reads.map(readCommand), ...mutations].map((command) => ({
+export const commands: ResourceCommand[] = [...reads.map(readCommand), ...pullRequestReads, ...mutations].map((command) => ({
   ...command,
   prepare(context) {
     const repository = context.options.string("repository") ?? (command.path.join(" ") === "repositories get" ? argument(context) : undefined);
@@ -521,8 +714,169 @@ export const commands: ResourceCommand[] = [...reads.map(readCommand), ...mutati
   },
 }));
 
+interface MergeTask {
+  task_id: string;
+  location?: string;
+}
+
+async function mergePullRequest(context: Context, client: Client, body: unknown): Promise<RunResult | undefined> {
+  const path = pullRequest(context, client.endpoint);
+  let task: MergeTask | undefined;
+  let status: number | undefined;
+  const plan: MutationPlan = {
+    effect: `Merges pull request ${argument(context)} in ${required(context, "repository")}.${context.options.string("close-source-branch") === "true" ? " Deletes the source branch after merging. There is no branch restore endpoint; recreation needs the previous commit hash." : ""}`,
+    steps: [{ name: "merge pull request", call: {
+      path: `${path}/merge`, method: "POST", mutation: true, body, keepalive: false,
+      settle({ data }, _context, helpers) {
+        status = helpers.provider.status;
+        if (status === 202) {
+          task = mergeTask(data, helpers, client.access().baseUrl);
+          return data;
+        }
+        return mergeState(data, helpers, argument(context), true);
+      },
+    } }],
+  };
+  if (context.options.flag("dry-run")) {
+    await client.mutate(plan);
+    return undefined;
+  }
+  const read: Call = {
+    path, method: "GET", mutation: false,
+    settle: ({ data }, _context, helpers) => mergeState(data, helpers, argument(context)),
+  };
+  const before = await client.send(read);
+  const current = before.data as Record<string, unknown>;
+  if (current.state === "MERGED") {
+    await client.mutate({ steps: [], effect: `Pull request ${argument(context)} is already MERGED. Makes no changes.` });
+    return { data: current, meta: { provider: { note: "Pull request is already MERGED; no merge request was sent." } } };
+  }
+  if (current.state !== "OPEN") throw mergePrecondition(current.state);
+  let result;
+  try {
+    result = await client.mutate(plan);
+  } catch (error) {
+    const failure = asCliError(error);
+    const httpStatus = failure.extra.provider?.status;
+    const uncertain = (httpStatus !== undefined && httpStatus >= 500 && httpStatus <= 599)
+      || (failure.code === "TRANSIENT_FAILURE" && failure.extra.outcome === "unknown");
+    if (!uncertain) throw failure;
+    return reconcileMerge(client, read, failure);
+  }
+  if (!result) return undefined;
+  if (!task) return { data: result[0]?.data ?? null, meta: { provider: { status } } };
+  return waitForMerge(context, client, path, task);
+}
+
+/** Validate inside response hooks so provider values and errors receive core redaction. */
+function mergeState(data: unknown, helpers: HookHelpers, expectedId: string, completed = false): Record<string, unknown> {
+  try {
+    if (!isRecord(data) || typeof data.id !== "number" || !Number.isSafeInteger(data.id) || data.id <= 0) {
+      throw responseField("pullrequest.id", "be a positive safe integer", isRecord(data) ? data.id : data);
+    }
+    if (String(data.id) !== expectedId.replace(/^0+(?=\d)/, "")) {
+      throw responseField("pullrequest.id", `match requested PULL_REQUEST_ID ${echoable(expectedId)}`, data.id);
+    }
+    if (typeof data.state !== "string" || !PR_STATES.includes(data.state)) {
+      throw responseField("pullrequest.state", `be one of ${PR_STATES.join(", ")}`, data.state);
+    }
+    if (completed && data.state !== "MERGED") throw responseField("pullrequest.state", "be MERGED after a successful merge", data.state);
+    if (data.state === "MERGED" && (!isRecord(data.merge_commit) || typeof data.merge_commit.hash !== "string" || data.merge_commit.hash === "")) {
+      throw responseField("pullrequest.merge_commit.hash", "be a nonempty string for a MERGED pull request", isRecord(data.merge_commit) ? data.merge_commit.hash : data.merge_commit);
+    }
+    return data;
+  } catch (error) {
+    const failure = asCliError(error);
+    throw new CliError(failure.code, failure.message, {
+      ...failure.extra, provider: helpers.provider, ...(completed ? { outcome: "unknown" } : {}),
+    });
+  }
+}
+
+function mergePrecondition(state: unknown, original?: CliError): CliError {
+  return new CliError("CONFLICT", `Pull request state must be OPEN to merge; received "${echoable(String(state))}".`, {
+    hint: "Inspect the pull request before attempting another merge.", retryable: false,
+    details: { pull_request_state: state, ...(original ? { original_error: mergeErrorDetail(original) } : {}) },
+  });
+}
+
+function mergeErrorDetail(failure: CliError) {
+  return { code: failure.code, message: failure.message, ...(failure.extra.provider ? { provider: failure.extra.provider } : {}) };
+}
+
+async function reconcileMerge(client: Client, read: Call, failure: CliError): Promise<RunResult> {
+  let checked;
+  try {
+    checked = await client.send(read);
+  } catch (error) {
+    throw new CliError(failure.code, failure.message, {
+      ...failure.extra, retryable: false, outcome: "unknown",
+      hint: "The merge outcome could not be verified. Read the pull request before retrying.",
+      details: { ...failure.extra.details, reconciliation_error: mergeErrorDetail(asCliError(error)) },
+    });
+  }
+  const current = checked.data as Record<string, unknown>;
+  if (current.state === "MERGED") return {
+    data: current,
+    meta: { provider: {
+      ...(failure.extra.provider?.status === undefined ? {} : { status: failure.extra.provider.status }),
+      note: "A PR read confirmed MERGED after an uncertain merge request; the merge POST was not retried.",
+    } },
+  };
+  if (current.state !== "OPEN") throw mergePrecondition(current.state, failure);
+  const { outcome: _outcome, ...extra } = failure.extra;
+  throw new CliError(failure.code, failure.message, {
+    ...extra, retryable: true,
+    hint: "The PR read returned OPEN. Retry the merge command to check its state again before sending another merge request.",
+    details: { ...extra.details, pull_request_state: "OPEN" },
+  });
+}
+
+async function waitForMerge(context: Context, client: Client, path: string, task: MergeTask): Promise<RunResult> {
+  const timeoutMs = context.options.number("wait-timeout") ?? MERGE_WAIT_MS;
+  let lastStatus: "PENDING" | "SUCCESS" | null = null;
+  try {
+    const completed = await client.poll({
+      path: `${path}/merge/task-status/${encodeURIComponent(task.task_id)}`, method: "GET", mutation: false,
+      ...(task.location ? { query: [...new URL(task.location).searchParams] } : {}),
+      settle({ data }, _context, helpers) {
+        if (!isRecord(data) || (data.task_status !== "PENDING" && data.task_status !== "SUCCESS")) {
+          const failure = responseField("task_status", "be PENDING or SUCCESS", isRecord(data) ? data.task_status : data);
+          throw new CliError(failure.code, failure.message, { ...failure.extra, provider: helpers.provider });
+        }
+        lastStatus = data.task_status;
+        if (data.task_status === "SUCCESS") mergeState(data.merge_result, helpers, argument(context), true);
+        return data;
+      },
+    }, {
+      intervalMs: MERGE_POLL_MS, timeoutMs,
+      until: (data) => isRecord(data) && data.task_status === "SUCCESS",
+    });
+    if (!completed) throw new CliError("TRANSIENT_FAILURE", `Merge task_status must reach SUCCESS within --wait-timeout ${timeoutMs}ms; last observed ${JSON.stringify(lastStatus)}.`, {
+      retryable: false, outcome: "unknown",
+    });
+    return {
+      data: (completed.data as Record<string, unknown>).merge_result,
+      meta: { provider: { status: 202, ...task, task_status: "SUCCESS" } },
+    };
+  } catch (error) {
+    const failure = asCliError(error);
+    throw stepsFailure({
+      completed: [{ step: "accept merge", result: { status: 202, ...task } }],
+      failed: [{ step: "wait for merge", error: mergeErrorDetail(failure) }],
+      not_attempted: [],
+    }, {
+      cause: failure.code,
+      ...(failure.extra.provider ? { provider: failure.extra.provider } : {}),
+      ...(["TRANSIENT_FAILURE", "RATE_LIMITED", "INVALID_RESPONSE"].includes(failure.code) ? { outcome: "unknown" as const } : {}),
+      details: { ...task, task_status: lastStatus },
+      hint: "The accepted merge was not rolled back. Read pull-requests merge-tasks get with this task_id before sending another merge request.",
+    });
+  }
+}
+
 /** An accepted merge supplies a polling Location, or a task_id in its response body. */
-function mergeTask(data: unknown, helpers: HookHelpers, baseUrl: string): Record<string, unknown> {
+function mergeTask(data: unknown, helpers: HookHelpers, baseUrl: string): MergeTask {
   const fail = () => new CliError("INVALID_RESPONSE", "Bitbucket Cloud accepted the merge but returned no valid task ID or task-status Location; completion is unknown.", {
     hint: "Check the pull request state before retrying.", outcome: "unknown", provider: helpers.provider,
   });
@@ -535,15 +889,9 @@ function mergeTask(data: unknown, helpers: HookHelpers, baseUrl: string): Record
     return { task_id: bodyId };
   }
   const request = new URL(`${baseUrl.replace(/\/+$/, "")}${helpers.request.path}`);
-  let url: URL;
-  try {
-    if (location === "" || /[\s\\?#]/.test(location)) throw fail();
-    url = new URL(location, request);
-  } catch {
-    throw fail();
-  }
+  const url = sameOriginUrl(location, request.toString(), true);
   const prefix = `${request.pathname}/task-status/`;
-  if (url.origin !== request.origin || url.username || url.password || !url.pathname.startsWith(prefix)) throw fail();
+  if (!url || !url.pathname.startsWith(prefix)) throw fail();
   const suffix = url.pathname.slice(prefix.length);
   let taskId: string;
   try {

@@ -2,7 +2,7 @@ import { CliError } from "./core/errors.js";
 import type { HookHelpers, Provider, ProviderErrorDetail } from "./core/provider.js";
 import { HTTP_METHODS } from "./core/types.js";
 import { isRecord, visibleAsciiConstraint } from "./core/values.js";
-import { commands, groups, securedInput, workspaceConstraint } from "./registry.js";
+import { commands, groups, pagination, securedInput, workspaceConstraint } from "./registry.js";
 
 export const provider: Provider = {
   bin: "bitbucket",
@@ -27,21 +27,7 @@ export const provider: Provider = {
   baseUrl: { default: "https://api.bitbucket.org/2.0", allowPath: true, joinPath: true },
   endpointFields: [{ key: "workspace", label: "workspace", placeholder: "SLUG", example: "acme", validate: workspaceConstraint }],
   accessLevels: true,
-  pagination: {
-    continuation: "url",
-    cursorSize: (url) => {
-      const sizes = url.searchParams.getAll("pagelen");
-      return sizes.length === 1 && /^[0-9]+$/.test(sizes[0] ?? "") ? Number(sizes[0]) : undefined;
-    },
-    apply: (request, page) => {
-      if (page.cursor === null) request.query.set("pagelen", String(page.size));
-    },
-    read: (payload) => {
-      if (!isRecord(payload)) return undefined;
-      if (payload.next !== undefined && payload.next !== null && typeof payload.next !== "string") return undefined;
-      return { nextCursor: payload.next ?? null };
-    },
-  },
+  pagination,
   requestIdHeader: ["x-request-id", "atl-traceid", "x-b3-traceid"],
   errorDetail,
   bodyFailure: (body) => isRecord(body) && body.type === "error" ? errorDetail(body) : undefined,

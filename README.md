@@ -41,7 +41,7 @@ Shell completion: `bitbucket completions bash > ~/.bash/profile.d/bitbucket.sh`.
 
 | Command | Description | Options |
 | --- | --- | --- |
-| bitbucket commits list | List commits in a repository. | --repository REPOSITORY, --workspace SLUG, --include REVISION, --exclude REVISION, --page-size N, --cursor TOKEN, --all, --max-items N |
+| bitbucket commits list | List commits in a repository. | --repository REPOSITORY, --workspace SLUG, --include REF, --exclude REF, --page-size N, --cursor TOKEN, --all, --max-items N |
 | bitbucket commits get COMMIT | Get one commit. | --repository REPOSITORY, --workspace SLUG |
 
 ### deployments
@@ -74,19 +74,21 @@ Shell completion: `bitbucket completions bash > ~/.bash/profile.d/bitbucket.sh`.
 
 | Command | Description | Options |
 | --- | --- | --- |
-| bitbucket pull-requests list | List pull requests in a repository. | --repository REPOSITORY, --workspace SLUG, --filter EXPRESSION, --sort FIELD, --state STATE, --page-size N, --cursor TOKEN, --all, --max-items N |
+| bitbucket pull-requests list | List pull requests in a repository. | --repository REPOSITORY, --workspace SLUG, --query EXPRESSION, --sort FIELD, --state STATE, --ticket KEY, --page-size N, --cursor TOKEN, --all, --max-items N |
 | bitbucket pull-requests get PULL_REQUEST_ID | Get one pull request. | --repository REPOSITORY, --workspace SLUG |
 | bitbucket pull-requests create | Create a pull request. | --repository REPOSITORY, --workspace SLUG, --file PATH, --title TEXT, --description TEXT, --body-file PATH, --destination BRANCH, --reviewer UUID, --close-source-branch BOOLEAN, --draft BOOLEAN, --source BRANCH, --source-repository REPOSITORY, --yes, --dry-run |
 | bitbucket pull-requests update PULL_REQUEST_ID | Update supplied pull request fields. | --repository REPOSITORY, --workspace SLUG, --file PATH, --title TEXT, --description TEXT, --body-file PATH, --destination BRANCH, --reviewer UUID, --close-source-branch BOOLEAN, --draft BOOLEAN, --clear-description, --clear-reviewers, --yes, --dry-run |
-| bitbucket pull-requests merge PULL_REQUEST_ID | Merge a pull request. | --repository REPOSITORY, --workspace SLUG, --message TEXT, --body-file PATH, --close-source-branch BOOLEAN, --strategy STRATEGY, --yes, --dry-run |
+| bitbucket pull-requests merge PULL_REQUEST_ID | Merge a pull request. | --repository REPOSITORY, --workspace SLUG, --message TEXT, --body-file PATH, --close-source-branch BOOLEAN, --strategy STRATEGY, --wait-timeout DURATION, --yes, --dry-run |
 | bitbucket pull-requests decline PULL_REQUEST_ID | Decline a pull request. | --repository REPOSITORY, --workspace SLUG, --yes, --dry-run |
 | bitbucket pull-requests approve PULL_REQUEST_ID | Approve a pull request. | --repository REPOSITORY, --workspace SLUG, --yes, --dry-run |
 | bitbucket pull-requests unapprove PULL_REQUEST_ID | Remove the current user's approval from a pull request. | --repository REPOSITORY, --workspace SLUG, --yes, --dry-run |
 | bitbucket pull-requests activity list PULL_REQUEST_ID | List activity on a pull request. | --repository REPOSITORY, --workspace SLUG, --page-size N, --cursor TOKEN, --all, --max-items N |
 | bitbucket pull-requests comments list PULL_REQUEST_ID | List comments on a pull request. | --repository REPOSITORY, --workspace SLUG, --page-size N, --cursor TOKEN, --all, --max-items N |
 | bitbucket pull-requests comments create PULL_REQUEST_ID | Create a comment on a pull request. | --repository REPOSITORY, --workspace SLUG, --text TEXT, --body-file PATH, --parent-id COMMENT_ID, --yes, --dry-run |
+| bitbucket pull-requests conflicts list PULL_REQUEST_ID | List file conflicts in a pull request. | --repository REPOSITORY, --workspace SLUG |
 | bitbucket pull-requests diff get PULL_REQUEST_ID | Get the text diff of a pull request. | --repository REPOSITORY, --workspace SLUG |
 | bitbucket pull-requests merge-tasks get TASK_ID | Get the status of an asynchronous merge. | --repository REPOSITORY, --workspace SLUG, --pull-request-id PULL_REQUEST_ID |
+| bitbucket pull-requests ticket-keys list PULL_REQUEST_ID | List ticket keys in pull request commit messages. | --repository REPOSITORY, --workspace SLUG, --project PROJ |
 
 ### repositories
 
@@ -257,12 +259,22 @@ The default output format is `human`: tables for collections and labeled fields 
 | `profile` | Every command that sends a request. The name of the profile that served it. |
 | `next_cursor` | The complete next URL, or `null` when no continuation remains. |
 | `has_more` | Whether unread pages remain. |
-| `provider` | List `size` when supplied. Merge responses include HTTP `status`; 202 means accepted. An accepted merge also includes `task_id` and a validated same-origin `location` when supplied. |
+| `provider` | List `size` when supplied. Merge results include HTTP `status` when a POST was sent, asynchronous `task_id`, `task_status`, and validated same-origin `location` when supplied. A `note` explains an already merged or reconciled PR. |
 | `dry_run`, `validation` | Dry-run previews. `validation` is `local`. |
 
-For an asynchronous merge, `meta.provider.task_id` identifies the task and `meta.provider.status: 202` reports acceptance. The CLI reads the task ID from a validated same-origin `Location` header or, when no header is returned, from the response body. `data` keeps the provider body and may be `null`. Run `pull-requests merge-tasks get TASK_ID --pull-request-id PULL_REQUEST_ID --repository REPOSITORY` to check completion. `pipelines run` returns the provider pipeline UUID and state; it does not wait. `pipelines stop` signals cancellation; use `pipelines get` to inspect the eventual state.
+`pull-requests merge` reads the PR before confirmation. If its state is `MERGED`, the command confirms a no-op and returns the PR, including `merge_commit.hash`, with a note and no merge POST. An `OPEN` PR can proceed; other states fail with `CONFLICT`. The profile must have write access, including for the no-op. `--dry-run` validates locally, previews the POST, and makes no requests.
 
-A synchronous merge response must include the pull request ID and state. A malformed response fails with `INVALID_RESPONSE` and `outcome: "unknown"`; check the pull request before retrying.
+The merge POST is sent at most once. If it fails with a network error, timeout, or any HTTP 5xx, the CLI reads the PR again using the normal read retry policy. `MERGED` returns success with a note. `OPEN` reports the original failure with `retryable: true`; another invocation checks the PR again before posting. Other states fail with `CONFLICT` and preserve the original failure in `details.original_error`. If reconciliation fails, the original failure keeps `outcome: "unknown"` and includes `details.reconciliation_error`.
+
+An HTTP 202 response starts automatic polling. The CLI reads the task ID from a validated same-origin `Location` header or, when no header is returned, from `task_id` in the body. Polling preserves the Location's query parameters, including repeated parameters. It polls every second until `task_status` is `SUCCESS`. `--wait-timeout DURATION` bounds the entire wait, including reads and retries, from acceptance. It defaults to `2m` and accepts `1ms` through `10m`. `--timeout` still limits each request. Success returns `merge_result` as `data`, including `merge_commit.hash`, and preserves the task identity and status in `meta.provider`.
+
+A failed or timed-out wait exits 8 with `PARTIAL_FAILURE`. `partial.completed` contains the accepted task, `partial.failed` contains the wait error, and `details` holds the task ID and last observed status, or `null` if no status was read. A timeout has `outcome: "unknown"`; the task may still complete. Run `pull-requests merge-tasks get TASK_ID --pull-request-id PULL_REQUEST_ID --repository REPOSITORY` before attempting another merge. An invalid synchronous response fails with `INVALID_RESPONSE` and `outcome: "unknown"`. Successful merges must supply the requested PR ID, state `MERGED`, and a nonempty `merge_commit.hash`. Every PR response is checked against `PULL_REQUEST_ID`, including the initial read, reconciliation, and asynchronous task result. A response for another PR cannot prove that the requested PR merged.
+
+```bash
+bitbucket pull-requests merge 42 --repository acme/service --strategy squash --wait-timeout 3m --yes --format json
+```
+
+`pipelines run` returns the provider pipeline UUID and state without waiting. `pipelines stop` signals cancellation; use `pipelines get` to inspect the eventual state.
 
 Bitbucket error bodies use `{"type":"error","error":{"message":"...","detail":"...","fields":{"title":["This field is required."]}}}`. The CLI combines `message`, `detail`, and validation messages from `fields`, preserves `error.code` if present, and maps HTTP status to the shared error vocabulary. Request IDs come from `x-request-id`, `atl-traceid`, `x-b3-traceid`, or `error.id`. An error body returned with HTTP 2xx also fails, using `PROVIDER_ERROR` when no HTTP error classification applies.
 
@@ -295,7 +307,7 @@ With `--format json`, errors print one compact document on stderr, for example `
 
 Remote mutations (every resource `create`, `update`, `delete`, `merge`, `decline`, `approve`, `unapprove`, `run`, and `stop` command) need a profile with write access and confirmation. The CLI validates arguments first, then checks the profile's access level (exit 4 for read access, before anything is sent, `--dry-run` included), then resolves credentials (exit 3 when missing), then asks for confirmation. In a terminal, it shows the profile, operation, request, and effect, then prompts. `--yes` confirms without a prompt. With `--no-input`, a non-terminal stdin or stderr, or CI mode, a missing confirmation exits 9. Ctrl-C or end of input at a prompt exits 130 with `INTERRUPTED`. `--dry-run` prints a redacted preview of the request, with headers in the order `Authorization`, `Accept`, `Content-Type`, and sends nothing. It needs a profile but no stored credentials. Preview success does not guarantee that the request succeeds.
 
-Reads make up to 3 attempts on HTTP 429, 500, 502, 503, 504, network errors, and timeouts, waiting 250 ms, then 500 ms, or the `Retry-After` value up to 10 seconds. A `Retry-After` above 10 seconds is not waited on: the command fails with `RATE_LIMITED` and `provider.retry_after_seconds`. Mutations make one attempt. When a mutation times out or Bitbucket Cloud answers with a server error, the error carries `outcome: "unknown"`: check the current state before you repeat it. `--timeout` applies to each attempt. `--verbose` writes redacted request, response, and retry diagnostics to stderr. A failure inside an HTTP 2xx body fails at once without a retry.
+Reads make up to 3 attempts on HTTP 429, 500, 502, 503, 504, network errors, and timeouts, waiting 250 ms, then 500 ms, or the `Retry-After` value up to 10 seconds. A `Retry-After` above 10 seconds is not waited on: the command fails with `RATE_LIMITED` and `provider.retry_after_seconds`. Mutations make one attempt. A mutation with an uncertain outcome reports `outcome: "unknown"`; merges first attempt the reconciliation described above. `--timeout` applies to each attempt. `--verbose` writes redacted request, response, and retry diagnostics to stderr. A failure inside an HTTP 2xx body fails at once without a retry.
 
 Branch deletion removes the branch reference. Bitbucket has no branch restore endpoint; recreation requires its previous commit hash to remain available. Unapproving a pull request removes your approval, which you can add again.
 
@@ -321,13 +333,39 @@ Pipeline files accept `target` and `variables`. Targets use `pipeline_ref_target
 
 ## Pagination
 
-Lists fetch one page by default. `--page-size N` sets the initial `pagelen`, from 10 to 100, default 100. `--all` follows complete next URLs, and `--cursor URL` resumes a previous `meta.next_cursor`. The CLI preserves each URL's path and query entries and rejects another origin, credentials, fragments, whitespace, or backslashes. Origin validation includes scheme and port and runs even when only one page is requested.
+Paginated lists fetch one page by default. `pull-requests list` accepts `--page-size N` from 10 to 50, default 50. Other paginated lists accept 10 to 100, default 100. Out-of-range values fail before requests. `--all` follows complete next URLs, and `--cursor URL` resumes a previous `meta.next_cursor`. The CLI preserves each URL's path and query entries and rejects another origin, credentials, fragments, whitespace, or backslashes. Origin validation includes scheme and port and runs even when only one page is requested. An explicit continuation `pagelen` must stay within the endpoint's limits. When it is absent, the CLI follows the URL unchanged and uses the endpoint maximum as an upper bound for page validation and the remaining `--max-items` budget. It does not assume that an opaque continuation uses a particular default page size.
 
 `--max-items N` requires `--all` and stops at a resumable page boundary. Continuation URLs keep their embedded page size, even if `--page-size` changes. If the next page exceeds the remaining budget, the CLI returns its cursor without reading it. The result can contain fewer than N items, including none. An initial budget below 10 returns an initial cursor without a request. For example, a page size of 10 and a bound of 25 can return 20 items, with the cursor for the next 10-item page.
 
-The CLI retains provider order and does not sort locally. Branch lists use lexical name order unless `--sort` is supplied; commits use reverse chronological order with descendants before parents. Other ordering is provider-defined. A server may return fewer than the requested number. `meta.has_more` reports remaining pages. Repeated cursors, empty pages with a continuation, oversized pages, and invalid continuation URLs fail. A failure after completed pages returns `PARTIAL_FAILURE` with those items in `partial.data` and the first unread cursor in `partial.next_cursor`.
+Paginated lists retain provider order. Branch lists use lexical name order unless `--sort` is supplied; commits use reverse chronological order with descendants before parents. Other ordering is provider-defined. A server may return fewer than the requested number. `meta.has_more` reports remaining pages. Repeated cursors, empty pages with a continuation, oversized pages, and invalid continuation URLs fail. A failure after completed pages returns `PARTIAL_FAILURE` with those items in `partial.data` and the first unread cursor in `partial.next_cursor`.
 
 Sensitive values in continuation URLs are hidden in diagnostics, error messages, and hints. Structured `next_cursor` values stay unchanged for resumption and can contain provider tokens; treat them as sensitive result data.
+
+`pull-requests list --all` returns every page for the selected filters. Duplicate PR IDs within or across pages fail instead of returning overlapping or repeated rows. Without `--state`, Bitbucket returns open PRs. Repeat `--state` to select any combination of `OPEN`, `MERGED`, `DECLINED`, and `SUPERSEDED`. `--query EXPRESSION` sends a BBQL expression as `q`. Repository and branch lists use `--filter`.
+
+Repeat `--ticket KEY` to match any requested ticket. Matching is case sensitive. The source branch must equal the key or start with the key followed by a hyphen, or the title must contain the key as a whole token. Unicode letters, combining marks, numbers, and underscores adjoining a key prevent a title token match. A ticket prefilter uses `source.branch.name ~ "KEY" OR title ~ "KEY"`; several keys are joined with `OR`, and `--query` is combined with that prefilter using `AND`. Exact matching runs locally after pagination, so near matches cannot hide later pages. Each returned PR gains `ticket_keys`, a sorted, unique array of all Jira-style keys in its title and source branch, including keys outside the requested filter.
+
+With `--ticket`, `--max-items`, `--page-size`, and `meta.provider.size` count server candidates before exact matching. A page can produce no matching PRs and still have `meta.has_more: true`. Resume with the same ticket filters. Keys match `[A-Z][A-Z0-9]+-[0-9]+` as whole tokens, so `PROJ-12` does not match `PROJ-123`.
+
+```bash
+bitbucket pull-requests list --repository acme/service --state OPEN --state MERGED --state DECLINED --state SUPERSEDED --all --format json
+bitbucket pull-requests list --repository acme/service --ticket PROJ-12 --ticket APP-34 --all --format json
+bitbucket pull-requests list --repository acme/service --ticket PROJ-12 --query 'destination.branch.name = "main"' --all --format json
+```
+
+`pull-requests conflicts list PULL_REQUEST_ID` fetches every page automatically and returns `data: {"has_conflicts": BOOLEAN, "conflicts": [...]}`. Each conflict retains its provider fields, including `path`, `scenario`, and `message` when supplied. The command uses the documented [PR file-conflicts endpoint](https://developer.atlassian.com/cloud/bitbucket/rest/api-group-pullrequests/#api-repositories-workspace-repo-slug-pullrequests-pull-request-id-conflicts-get), which redirects to [repository file conflicts](https://developer.atlassian.com/cloud/bitbucket/rest/api-group-commits/#api-repositories-workspace-repo-slug-file-conflicts-spec-get). This reports conflict paths directly, avoiding interpretation of diffstat statuses such as `merge conflict`, `local deleted`, or `remote deleted`. It follows up to three redirects on the configured origin per request. The result reflects Bitbucket's view at the time of the call. A clean result does not guarantee mergeability because permissions, merge checks, and later branch changes can still block merging.
+
+`pull-requests ticket-keys list PULL_REQUEST_ID` fetches every page of the PR's commits, which are the commits not on its destination, and extracts keys from their complete messages. It returns `[{"key": "PROJ-12", "commit_hashes": ["..."]}]`. Keys and hashes use lexicographic order with duplicates removed. Repeat `--project PROJ` to keep exact project prefixes; omitted means every project. Bitbucket returns no commits if the source branch no longer exists, so an empty result does not prove there were no ticket references before branch deletion.
+
+Both derived lists request 100 items per page internally and accept no pagination flags. Duplicate conflict paths or commit hashes within or across pages fail instead of producing a successful result from repeated source rows. On success, `meta.next_cursor` is `null` and `meta.has_more` is `false`. If a later page fails, the command exits 8. `partial.data` contains the conflict or commit objects already read, and `partial.next_cursor` identifies the failed source page. For ticket extraction, those commits are incomplete input, not the final key list. Run the command again to rebuild the complete result.
+
+`commits list --include REF --exclude REF --all` lists commits reachable from included refs but not from excluded refs. Both options are repeatable. Omitted `--include` means all refs; the CLI does not assume a destination branch.
+
+```bash
+bitbucket pull-requests conflicts list 42 --repository acme/service --format json
+bitbucket pull-requests ticket-keys list 42 --repository acme/service --project PROJ --project APP --format json
+bitbucket commits list --repository acme/service --include feature/PROJ-12 --exclude main --all --format json
+```
 
 ## Raw API access
 
@@ -370,10 +408,11 @@ Completion scripts come from `bitbucket completions bash|zsh|fish` and read only
 | Rule | Decision | Reason |
 | --- | --- | --- |
 | `CLI-GRAM-4` | Pull request `merge`, `decline`, `approve`, `unapprove`; pipeline `run`, `stop`. | These retain provider operation names. |
-| `STYLE-OUT-2` | Merge responses include HTTP status and asynchronous task metadata in `meta.provider`. | A merge can return an empty HTTP 202 response with its task URL in the `Location` header; preserving the body alone would lose the task identifier. |
+| `STYLE-OUT-2` | Merge responses include HTTP status, asynchronous task metadata, and reconciliation notes in `meta.provider`. | The final PR alone does not identify the task or explain a skipped or reconciled POST. |
+| `STYLE-ERR-3` | An uncertain merge POST followed by a PR read returning `OPEN` reports the original failure as retryable. | Another invocation rechecks state before sending its single merge POST. |
 | `STYLE-PAGE-2` | Continuations keep their page size; bounds can return fewer than N items. | Changing the page length of a numbered URL would skip or duplicate items. |
-| `STYLE-TIME-1` | Diff and step-log reads follow up to three redirects on the configured origin. | These endpoints can redirect to the text resource. Every hop shares the attempt timeout. |
-| `STYLE-OPT-6` | `--page-size` accepts 10 to 100. | The provider's pagination reference specifies a global minimum of 10. |
+| `STYLE-TIME-1` | Diff, step-log, and conflict reads follow up to three redirects on the configured origin. | These endpoints can redirect to their resource. Every hop shares the attempt timeout. |
+| `STYLE-OPT-6` | `--page-size` accepts 10 to 50 for PR lists, and 10 to 100 for other paginated lists. | The provider's pagination reference specifies a global minimum of 10; PR lists have a lower maximum. |
 
 ## Development
 
